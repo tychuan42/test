@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import zipfile
 from flask import Flask, request, jsonify, Response
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
@@ -10,6 +12,7 @@ from presidio_analyzer.predefined_recognizers import (
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 from presidio_anonymizer.operators import Operator, OperatorType
+from docx import Document
 
 SUPPORTED_LANGUAGES = ["en", "sk"]
 
@@ -63,8 +66,7 @@ class InstanceCounterAnonymizer(Operator):
 nlp_engine = NlpEngineProvider(nlp_configuration=NLP_CONFIG).create_engine()
 registry = RecognizerRegistry(supported_languages=SUPPORTED_LANGUAGES)
 registry.load_predefined_recognizers(nlp_engine=nlp_engine, languages=SUPPORTED_LANGUAGES)
-# Globálne pattern rozpoznávače (karta, IBAN, email, telefón, IP, krypto, URL) sú viazané
-# na jazyky z konfigurácie a pre "sk" sa nenačítajú. Doplníme ich ručne:
+# Globálne pattern rozpoznávače sú viazané na jazyky z konfigurácie a pre "sk" sa nenačítajú. Doplníme ručne:
 for _cls in (CreditCardRecognizer, IbanRecognizer, EmailRecognizer,
              PhoneRecognizer, IpRecognizer, CryptoRecognizer, UrlRecognizer):
     registry.add_recognizer(_cls(supported_language="sk"))
@@ -87,7 +89,6 @@ def operators(approach):
 
 
 def custom_term_results(text, terms):
-    """Pre každé vlastné meno/pravidlo nájde všetky výskyty (bez ohľadu na veľkosť písmen) ako PERSON."""
     out = []
     for term in terms:
         term = (term or "").strip()
@@ -96,6 +97,112 @@ def custom_term_results(text, terms):
         for m in re.finditer(re.escape(term), text, flags=re.IGNORECASE):
             out.append(RecognizerResult(entity_type="PERSON", start=m.start(), end=m.end(), score=1.0))
     return out
+
+
+def analyze_and_filter(text, language, threshold, custom_terms, allow_list):
+    """Spoločné jadro: detekcia + vlastné pravidlá + deduplikácia + výnimky (allowlist)."""
+    results = analyzer.analyze(text=text, language=language, score_threshold=threshold)
+    results = results + custom_term_results(text, custom_terms)
+    best = {}
+    for r in results:
+        k = (r.start, r.end)
+        if k not in best or r.score > best[k].score:
+            best[k] = r
+    results = sorted(best.values(), key=lambda r: r.start)
+    allow_lower = {a.strip().lower() for a in allow_list if a and a.strip()}
+    if allow_lower:
+        results = [r for r in results if text[r.start:r.end].lower() not in allow_lower]
+    return results
+
+
+def anonymize_with(text, results, approach, entity_mapping=None):
+    if approach == "pseudonymize":
+        em = entity_mapping if entity_mapping is not None else {}
+        return anonymizer.anonymize(
+            text=text, analyzer_results=results,
+            operators={"DEFAULT": OperatorConfig("entity_counter", {"entity_mapping": em})}).text
+    return anonymizer.anonymize(text=text, analyzer_results=results, operators=operators(approach)).text
+
+
+# ---------- .docx anonymizácia + čistenie metadát ----------
+def _all_paragraphs(doc):
+    def walk(parent):
+        for p in parent.paragraphs:
+            yield p
+        for tbl in parent.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    yield from walk(cell)
+    yield from walk(doc)
+    for section in doc.sections:
+        for hf in (section.header, section.footer,
+                   section.first_page_header, section.first_page_footer,
+                   section.even_page_header, section.even_page_footer):
+            yield from walk(hf)
+
+
+def _set_para_text(p, new_text):
+    if not p.runs:
+        return  # text mimo priamych runov (napr. hyperlink) necháme tak
+    p.runs[0].text = new_text
+    for r in p.runs[1:]:
+        r.text = ""
+
+
+def _strip_core(doc):
+    cp = doc.core_properties
+    for a in ("author", "last_modified_by", "title", "subject", "keywords",
+              "comments", "category", "content_status", "identifier"):
+        try:
+            setattr(cp, a, "")
+        except Exception:
+            pass
+    try:
+        cp.revision = 1
+    except Exception:
+        pass
+
+
+def _scrub_zip_metadata(data):
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    buf = io.BytesIO()
+    zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    for item in zin.infolist():
+        name = item.filename
+        if name.startswith("docProps/thumbnail"):
+            continue  # zahoď vizuálny náhľad prvej strany
+        content = zin.read(name)
+        if name == "docProps/app.xml":
+            txt = content.decode("utf-8", "ignore")
+            for tag in ("Company", "Manager", "Template", "LastAuthor"):
+                txt = re.sub(r"<{0}>.*?</{0}>".format(tag), "<{0}></{0}>".format(tag), txt, flags=re.S)
+            content = txt.encode("utf-8")
+        elif name == "docProps/custom.xml":
+            content = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                       b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+                       b'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"></Properties>')
+        elif name == "_rels/.rels":
+            txt = content.decode("utf-8", "ignore")
+            txt = re.sub(r"<Relationship[^>]*thumbnail[^>]*/>", "", txt)
+            content = txt.encode("utf-8")
+        zout.writestr(item, content)
+    zout.close()
+    zin.close()
+    return buf.getvalue()
+
+
+def anonymize_docx_bytes(data, anon_fn):
+    doc = Document(io.BytesIO(data))
+    for p in _all_paragraphs(doc):
+        block = "".join(r.text for r in p.runs)
+        if block.strip():
+            new = anon_fn(block)
+            if new != block:
+                _set_para_text(p, new)
+    _strip_core(doc)
+    out = io.BytesIO()
+    doc.save(out)
+    return _scrub_zip_metadata(out.getvalue())
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -145,15 +252,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   @keyframes sp{to{transform:rotate(360deg)}}
   .main{flex:1;padding:30px 34px;min-width:0}
   .cols{display:grid;grid-template-columns:1fr 1fr;gap:22px}
-  .col-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;min-height:30px}
+  .col-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;min-height:30px;gap:10px}
   .col-head h2{margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
   .head-actions{display:flex;gap:8px}
   .iconbtn{background:var(--panel2);border:1px solid var(--line);color:var(--ink);border-radius:8px;
-    padding:6px 11px;font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s}
+    padding:6px 11px;font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;white-space:nowrap}
   .iconbtn:hover:not(:disabled){border-color:var(--accent);color:#c7d2fe}
   .iconbtn:active:not(:disabled){transform:translateY(1px)}
   .iconbtn:disabled{opacity:.4;cursor:default}
   .iconbtn.ok{border-color:var(--ok);color:var(--ok)}
+  .iconbtn.accent{border-color:var(--accent);color:#c7d2fe}
   textarea{width:100%;min-height:280px;resize:vertical;background:var(--panel);color:var(--ink);
     border:1px solid var(--line);border-radius:12px;padding:16px;font-size:14px;line-height:1.6;
     font-family:ui-monospace,Menlo,Consolas,monospace;outline:none;transition:border-color .15s}
@@ -190,6 +298,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .rest-head{display:none;justify-content:space-between;align-items:center;margin:18px 0 8px}
   .rest-head .rlabel{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
   #mapWrap{margin-top:18px}
+  .restored{color:#86efac}
   .maptag{font-family:ui-monospace,Menlo,monospace;font-weight:700}
   @media(max-width:880px){.layout{flex-direction:column}.side{width:auto;position:static;height:auto}.cols{grid-template-columns:1fr}}
 </style>
@@ -234,10 +343,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="cols">
       <div class="col">
         <div class="col-head"><h2>Vstup</h2><div class="head-actions">
+          <button class="iconbtn accent" id="importBtn">Import .docx</button>
           <button class="iconbtn" id="sample">Príklad</button>
           <button class="iconbtn" id="clearIn">Vyčistiť</button>
+          <input type="file" id="fileInput" accept=".docx" style="display:none">
         </div></div>
-        <textarea id="text" placeholder="Vlož text, ktorý chceš anonymizovať…"></textarea>
+        <textarea id="text" placeholder="Vlož text, ktorý chceš anonymizovať… alebo nahraj .docx cez Import."></textarea>
       </div>
       <div class="col">
         <div class="col-head"><h2>Výstup</h2><button class="iconbtn" id="copyOut" disabled>Kopírovať</button></div>
@@ -312,6 +423,31 @@ async function run(){
   finally{$("go").disabled=false;$("go").textContent="Anonymizovať";}
 }
 
+async function importDocx(e){
+  const file=e.target.files[0]; e.target.value="";
+  if(!file)return;
+  $("err").classList.remove("show");
+  const fd=new FormData();
+  fd.append("file",file);
+  fd.append("language",$("lang").value);
+  fd.append("approach",$("approach").value);
+  fd.append("threshold",$("threshold").value);
+  fd.append("custom_terms",$("customTerms").value);
+  fd.append("allow_list",$("allowList").value);
+  $("importBtn").disabled=true;$("importBtn").textContent="Spracúvam…";
+  try{
+    const res=await fetch("/api/anonymize-docx",{method:"POST",body:fd});
+    if(!res.ok){let m="Spracovanie .docx zlyhalo.";try{m=(await res.json()).error||m;}catch(_){}showErr(m);return;}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");a.href=url;a.download="anon_"+file.name;
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+    $("output").innerHTML='<span class="restored">✓ Anonymizovaný súbor stiahnutý: anon_'+esc(file.name)+'</span>\n<span class="placeholder">Vyčistený text aj metadáta (autor, názov, firma, custom props) a náhľad strany.</span>';
+    $("copyOut").disabled=true;
+  }catch(err){showErr("Nepodarilo sa spojiť so serverom.");}
+  finally{$("importBtn").disabled=false;$("importBtn").textContent="Import .docx";}
+}
+
 function render(data){
   lastOutput=data.anonymized_text||"";
   const html=esc(lastOutput).replace(/&lt;([^&]+?)&gt;/g,(full,inner)=>{
@@ -365,6 +501,8 @@ $("go").addEventListener("click",run);
 $("restoreBtn").addEventListener("click",restore);
 $("copyOut").addEventListener("click",()=>copyText(lastOutput,$("copyOut")));
 $("copyRestore").addEventListener("click",()=>copyText($("restoreOut").textContent,$("copyRestore")));
+$("importBtn").addEventListener("click",()=>$("fileInput").click());
+$("fileInput").addEventListener("change",importDocx);
 $("clearIn").addEventListener("click",()=>{
   $("text").value="";$("output").innerHTML='<span class="placeholder">Výsledok sa zobrazí tu.</span>';
   $("copyOut").disabled=true;$("count").textContent="0";$("stats").innerHTML="";
@@ -397,38 +535,55 @@ def api_anonymize():
     if not text:
         return jsonify({"error": "Prázdny text."}), 400
 
-    results = analyzer.analyze(text=text, language=language, score_threshold=threshold)
-    results = results + custom_term_results(text, custom_terms)
-
-    # zlúč duplicitné rozsahy (vyššie skóre vyhráva)
-    best = {}
-    for r in results:
-        k = (r.start, r.end)
-        if k not in best or r.score > best[k].score:
-            best[k] = r
-    results = sorted(best.values(), key=lambda r: r.start)
-
-    # výnimky — tieto presné hodnoty sa nikdy neanonymizujú
-    allow_lower = {a.strip().lower() for a in allow_list if a and a.strip()}
-    if allow_lower:
-        results = [r for r in results if text[r.start:r.end].lower() not in allow_lower]
-
+    results = analyze_and_filter(text, language, threshold, custom_terms, allow_list)
     findings = [{"entity_type": r.entity_type, "text": text[r.start:r.end],
                  "start": r.start, "end": r.end, "score": round(r.score, 2)} for r in results]
 
     if approach == "pseudonymize":
-        entity_mapping = {}
-        anon = anonymizer.anonymize(
-            text=text, analyzer_results=results,
-            operators={"DEFAULT": OperatorConfig("entity_counter", {"entity_mapping": entity_mapping})})
+        em = {}
+        anon_text = anonymize_with(text, results, approach, em)
         mapping = [{"placeholder": ph, "original": orig, "entity_type": et}
-                   for et, d in entity_mapping.items() for orig, ph in d.items()]
-        return jsonify({"anonymized_text": anon.text, "findings": findings,
+                   for et, d in em.items() for orig, ph in d.items()]
+        return jsonify({"anonymized_text": anon_text, "findings": findings,
                         "count": len(findings), "mapping": mapping})
 
-    anon = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators(approach))
-    return jsonify({"anonymized_text": anon.text, "findings": findings,
+    anon_text = anonymize_with(text, results, approach)
+    return jsonify({"anonymized_text": anon_text, "findings": findings,
                     "count": len(findings), "mapping": []})
+
+
+@app.route("/api/anonymize-docx", methods=["POST"])
+def api_anonymize_docx():
+    f = request.files.get("file")
+    if not f or not (f.filename or "").lower().endswith(".docx"):
+        return jsonify({"error": "Nahraj .docx súbor."}), 400
+    language = request.form.get("language") if request.form.get("language") in SUPPORTED_LANGUAGES else "en"
+    approach = request.form.get("approach") or "replace"
+    try:
+        threshold = float(request.form.get("threshold", 0.0))
+    except (TypeError, ValueError):
+        threshold = 0.0
+    custom_terms = [s.strip() for s in (request.form.get("custom_terms") or "").splitlines() if s.strip()]
+    allow_list = [s.strip() for s in (request.form.get("allow_list") or "").splitlines() if s.strip()]
+
+    entity_mapping = {}  # zdieľané cez celý dokument -> rovnaké meno = rovnaký tag všade
+
+    def anon_fn(block):
+        results = analyze_and_filter(block, language, threshold, custom_terms, allow_list)
+        if not results:
+            return block
+        return anonymize_with(block, results, approach, entity_mapping)
+
+    try:
+        out = anonymize_docx_bytes(f.read(), anon_fn)
+    except Exception as e:
+        return jsonify({"error": "Spracovanie .docx zlyhalo: {}".format(e)}), 500
+
+    base = re.sub(r"[^A-Za-z0-9_.-]", "_", (f.filename or "dokument.docx").rsplit("/", 1)[-1])
+    return Response(
+        out,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": 'attachment; filename="anon_{}"'.format(base)})
 
 
 @app.route("/healthz")

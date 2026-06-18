@@ -1,35 +1,11 @@
 services:
   ui:
-    build: ./ui
+    build: ./app
     container_name: presidio-ui
     restart: unless-stopped
     ports:
-      - "80:8000"          # jediný verejný port
-    environment:
-      - ANALYZER_URL=http://presidio-analyzer:3000
-      - ANONYMIZER_URL=http://presidio-anonymizer:3000
-    depends_on:
-      - presidio-analyzer
-      - presidio-anonymizer
-
-  presidio-analyzer:
-    image: mcr.microsoft.com/presidio-analyzer:latest
-    container_name: presidio-analyzer
-    restart: unless-stopped
-    expose:
-      - "3000"             # len interne, žiadny host port
+      - "80:8000"
     deploy:
       resources:
         limits:
           memory: 4G
-
-  presidio-anonymizer:
-    image: mcr.microsoft.com/presidio-anonymizer:latest
-    container_name: presidio-anonymizer
-    restart: unless-stopped
-    expose:
-      - "3000"
-    deploy:
-      resources:
-        limits:
-          memory: 1G

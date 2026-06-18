@@ -4,6 +4,7 @@ from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
+from presidio_anonymizer.operators import Operator, OperatorType
 
 SUPPORTED_LANGUAGES = ["en", "sk"]
 
@@ -25,16 +26,44 @@ NLP_CONFIG = {
     },
 }
 
+# čitateľné slovenské označenia pre pseudonymizačné tagy
+LABELS = {"PERSON": "Meno", "LOCATION": "Miesto", "EMAIL_ADDRESS": "Email", "PHONE_NUMBER": "Telefon",
+          "CREDIT_CARD": "Karta", "IBAN_CODE": "IBAN", "IP_ADDRESS": "IP", "DATE_TIME": "Datum",
+          "ORGANIZATION": "Organizacia", "CRYPTO": "Krypto", "URL": "URL", "NRP": "NRP", "US_SSN": "SSN"}
+
+
+class InstanceCounterAnonymizer(Operator):
+    """Každú unikátnu hodnotu nahradí číslovaným tagom, napr. <Meno1>. Rovnaká hodnota = rovnaký tag."""
+
+    def operate(self, text=None, params=None):
+        entity_type = params["entity_type"]
+        mapping = params["entity_mapping"]
+        per_type = mapping.setdefault(entity_type, {})
+        if text in per_type:
+            return per_type[text]
+        placeholder = "<{}{}>".format(LABELS.get(entity_type, entity_type), len(per_type) + 1)
+        per_type[text] = placeholder
+        return placeholder
+
+    def validate(self, params=None):
+        pass
+
+    def operator_name(self):
+        return "entity_counter"
+
+    def operator_type(self):
+        return OperatorType.Anonymize
+
+
 # --- engines sa postavia raz pri štarte ---
 nlp_engine = NlpEngineProvider(nlp_configuration=NLP_CONFIG).create_engine()
-registry = RecognizerRegistry()
-# kľúčové: regexové rozpoznávače sa načítajú pre OBA jazyky
+registry = RecognizerRegistry(supported_languages=SUPPORTED_LANGUAGES)
 registry.load_predefined_recognizers(nlp_engine=nlp_engine, languages=SUPPORTED_LANGUAGES)
 analyzer = AnalyzerEngine(registry=registry, nlp_engine=nlp_engine,
                           supported_languages=SUPPORTED_LANGUAGES)
 anonymizer = AnonymizerEngine()
+anonymizer.add_anonymizer(InstanceCounterAnonymizer)
 
-app = Flask(__name__)
 
 def operators(approach):
     if approach == "redact":
@@ -46,34 +75,6 @@ def operators(approach):
     else:
         cfg = OperatorConfig("replace", {})
     return {"DEFAULT": cfg}
-
-@app.route("/api/anonymize", methods=["POST"])
-def api_anonymize():
-    data = request.get_json(force=True, silent=True) or {}
-    text = (data.get("text") or "").strip()
-    language = data.get("language") if data.get("language") in SUPPORTED_LANGUAGES else "en"
-    approach = data.get("approach") or "replace"
-    try:
-        threshold = float(data.get("threshold", 0.0))
-    except (TypeError, ValueError):
-        threshold = 0.0
-    if not text:
-        return jsonify({"error": "Prázdny text."}), 400
-
-    results = analyzer.analyze(text=text, language=language, score_threshold=threshold)
-    findings = [{"entity_type": r.entity_type, "text": text[r.start:r.end],
-                 "start": r.start, "end": r.end, "score": round(r.score, 2)} for r in results]
-    anon = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators(approach))
-
-    return jsonify({"anonymized_text": anon.text, "findings": findings, "count": len(findings)})
-
-@app.route("/healthz")
-def healthz():
-    return "ok", 200
-
-@app.route("/")
-def index():
-    return Response(INDEX_HTML, mimetype="text/html")
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -131,6 +132,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .empty{color:var(--muted);font-size:13px;padding:12px 0}
   .bar{height:5px;border-radius:3px;background:linear-gradient(90deg,var(--accent),#22d3ee);
     display:inline-block;vertical-align:middle;margin-right:8px}
+  .restore{margin-top:30px}
+  .restore h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 6px}
+  .restore .hint{font-size:12.5px;color:var(--muted);margin:0 0 12px;line-height:1.5}
+  .restore textarea{min-height:120px}
+  .run2{margin-top:12px;background:var(--accent);color:#fff;border:0;border-radius:9px;
+    padding:11px 16px;font-size:14px;font-weight:700;cursor:pointer}
+  .run2:hover{background:var(--accent2)}
+  #mapWrap{margin-top:18px}
+  .maptag{font-family:ui-monospace,Menlo,monospace;color:#a5b4fc;font-weight:700}
   @media(max-width:880px){.layout{flex-direction:column}.side{width:auto}.cols{grid-template-columns:1fr}}
 </style>
 </head>
@@ -149,6 +159,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <option value="redact">Odstrániť</option>
         <option value="mask">Maskovať (****)</option>
         <option value="hash">Hash (SHA-256)</option>
+        <option value="pseudonymize">Pseudonymizovať (&lt;Meno1&gt;, zvratné)</option>
       </select>
     </div>
     <div class="ctl">
@@ -168,11 +179,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <h2>Nájdené entity (<span id="count">0</span>)</h2>
       <div id="tableWrap"><div class="empty">Zatiaľ nič — spusti anonymizáciu.</div></div>
     </div>
+    <div class="restore" id="restore" style="display:none">
+      <h2>De-anonymizácia — mapa žije len v tvojom prehliadači</h2>
+      <p class="hint">Vlož text, ktorý ti prišiel späť (napr. odpoveď z LLM) s tagmi typu &lt;Meno1&gt;. Nahradia sa pôvodnými hodnotami z mapy nižšie. Na server sa neposiela nič.</p>
+      <textarea id="restoreIn" placeholder="Sem vlož text s tagmi…"></textarea>
+      <button class="run2" id="restoreBtn">Obnoviť pôvodné hodnoty</button>
+      <div class="output" id="restoreOut" style="margin-top:14px;display:none"></div>
+      <div id="mapWrap"></div>
+    </div>
   </main>
 </div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+let pseudoMap=[];
 $("threshold").addEventListener("input",e=>$("thVal").textContent=Number(e.target.value).toFixed(2));
 async function run(){
   const text=$("text").value;
@@ -189,9 +209,16 @@ async function run(){
   finally{$("go").disabled=false;$("go").textContent="Anonymizovať";}
 }
 function render(data){
-  let html=esc(data.anonymized_text).replace(/&lt;[A-Z_]+&gt;/g,m=>'<span class="tok">'+m+'</span>');
+  let html=esc(data.anonymized_text).replace(/&lt;[^&]+?&gt;/g,m=>'<span class="tok">'+m+'</span>');
   $("output").innerHTML=html||'<span class="placeholder">—</span>';
   $("count").textContent=data.count;
+  pseudoMap=data.mapping||[];
+  if(pseudoMap.length){
+    $("restore").style.display="";
+    $("restoreIn").value=data.anonymized_text;
+    $("restoreOut").style.display="none";
+    renderMap();
+  }else{$("restore").style.display="none";}
   const f=data.findings||[];
   if(!f.length){$("tableWrap").innerHTML='<div class="empty">Žiadne osobné údaje neboli nájdené.</div>';return;}
   const rows=f.map((e,i)=>{const w=Math.max(6,Math.round(e.score*46));
@@ -199,8 +226,63 @@ function render(data){
       '</td><td>'+e.start+'</td><td>'+e.end+'</td><td><span class="bar" style="width:'+w+'px"></span>'+e.score.toFixed(2)+'</td></tr>';}).join("");
   $("tableWrap").innerHTML='<table><thead><tr><th>#</th><th>Typ entity</th><th>Text</th><th>Začiatok</th><th>Koniec</th><th>Skóre</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
+function renderMap(){
+  const rows=pseudoMap.map(m=>'<tr><td class="maptag">'+esc(m.placeholder)+'</td><td class="mono">'+esc(m.original)+'</td><td class="type">'+esc(m.entity_type)+'</td></tr>').join("");
+  $("mapWrap").innerHTML='<table><thead><tr><th>Tag</th><th>Pôvodná hodnota</th><th>Typ</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+function restore(){
+  let out=$("restoreIn").value;
+  pseudoMap.forEach(m=>{out=out.split(m.placeholder).join(m.original);});
+  $("restoreOut").textContent=out;
+  $("restoreOut").style.display="";
+}
 function showErr(m){$("err").textContent=m;$("err").classList.add("show");}
 $("go").addEventListener("click",run);
+$("restoreBtn").addEventListener("click",restore);
 </script>
 </body>
 </html>"""
+
+app = Flask(__name__)
+
+
+@app.route("/api/anonymize", methods=["POST"])
+def api_anonymize():
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    language = data.get("language") if data.get("language") in SUPPORTED_LANGUAGES else "en"
+    approach = data.get("approach") or "replace"
+    try:
+        threshold = float(data.get("threshold", 0.0))
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if not text:
+        return jsonify({"error": "Prázdny text."}), 400
+
+    results = analyzer.analyze(text=text, language=language, score_threshold=threshold)
+    findings = [{"entity_type": r.entity_type, "text": text[r.start:r.end],
+                 "start": r.start, "end": r.end, "score": round(r.score, 2)} for r in results]
+
+    if approach == "pseudonymize":
+        entity_mapping = {}
+        anon = anonymizer.anonymize(
+            text=text, analyzer_results=results,
+            operators={"DEFAULT": OperatorConfig("entity_counter", {"entity_mapping": entity_mapping})})
+        mapping = [{"placeholder": ph, "original": orig, "entity_type": et}
+                   for et, d in entity_mapping.items() for orig, ph in d.items()]
+        return jsonify({"anonymized_text": anon.text, "findings": findings,
+                        "count": len(findings), "mapping": mapping})
+
+    anon = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators(approach))
+    return jsonify({"anonymized_text": anon.text, "findings": findings,
+                    "count": len(findings), "mapping": []})
+
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+
+@app.route("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")

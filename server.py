@@ -3,6 +3,10 @@ import re
 from flask import Flask, request, jsonify, Response
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_analyzer.predefined_recognizers import (
+    CreditCardRecognizer, IbanRecognizer, EmailRecognizer,
+    PhoneRecognizer, IpRecognizer, CryptoRecognizer, UrlRecognizer,
+)
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 from presidio_anonymizer.operators import Operator, OperatorType
@@ -59,6 +63,11 @@ class InstanceCounterAnonymizer(Operator):
 nlp_engine = NlpEngineProvider(nlp_configuration=NLP_CONFIG).create_engine()
 registry = RecognizerRegistry(supported_languages=SUPPORTED_LANGUAGES)
 registry.load_predefined_recognizers(nlp_engine=nlp_engine, languages=SUPPORTED_LANGUAGES)
+# Globálne pattern rozpoznávače (karta, IBAN, email, telefón, IP, krypto, URL) sú viazané
+# na jazyky z konfigurácie a pre "sk" sa nenačítajú. Doplníme ich ručne:
+for _cls in (CreditCardRecognizer, IbanRecognizer, EmailRecognizer,
+             PhoneRecognizer, IpRecognizer, CryptoRecognizer, UrlRecognizer):
+    registry.add_recognizer(_cls(supported_language="sk"))
 analyzer = AnalyzerEngine(registry=registry, nlp_engine=nlp_engine,
                           supported_languages=SUPPORTED_LANGUAGES)
 anonymizer = AnonymizerEngine()
@@ -121,7 +130,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .slider-row .val{color:var(--accent);font-weight:700;font-size:13px}
   input[type=range]{width:100%;accent-color:var(--accent)}
   .scale{display:flex;justify-content:space-between;font-size:11px;color:var(--muted2);margin-top:2px}
-  textarea.mini{width:100%;min-height:90px;resize:vertical;background:var(--panel2);color:var(--ink);
+  textarea.mini{width:100%;min-height:84px;resize:vertical;background:var(--panel2);color:var(--ink);
     border:1px solid var(--line);border-radius:9px;padding:10px 12px;font-size:13px;line-height:1.5;
     font-family:ui-monospace,Menlo,Consolas,monospace;outline:none;transition:border-color .15s}
   textarea.mini:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,.18)}
@@ -207,11 +216,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="slider-row"><label style="margin:0">Prah dôveryhodnosti</label><span class="val" id="thVal">0.35</span></div>
       <input type="range" id="threshold" min="0" max="1" step="0.05" value="0.35">
       <div class="scale"><span>0.00</span><span>1.00</span></div>
+      <p class="minihint">Minimálna istota nálezu (0–1). Nižšie = nájde aj menej isté veci (viac falošných poplachov); vyššie = len isté nálezy. Regex (karta, IBAN, e-mail) máva skóre ≈1, mená z jazykového modelu zvyčajne nižšie — preto ak mená vypadávajú, prah zníž.</p>
     </div>
     <div class="ctl">
       <label for="customTerms">Vlastné mená / pravidlá</label>
       <textarea id="customTerms" class="mini" placeholder="Jedno meno na riadok, napr.:&#10;Marek Novák&#10;Žofia"></textarea>
       <p class="minihint">Vždy sa označia (bez ohľadu na veľké/malé písmená) a dostanú tag ako ostatné mená.</p>
+    </div>
+    <div class="ctl">
+      <label for="allowList">Nikdy neanonymizovať</label>
+      <textarea id="allowList" class="mini" placeholder="Jedna hodnota na riadok, napr.:&#10;Anthropic&#10;Bratislava"></textarea>
+      <p class="minihint">Tieto presné hodnoty ostanú v texte aj keď ich model označí (bez ohľadu na veľké/malé písmená).</p>
     </div>
     <button class="run" id="go">Anonymizovať</button>
   </aside>
@@ -284,11 +299,12 @@ async function run(){
   $("err").classList.remove("show");
   if(!text.trim()){showErr("Zadaj nejaký text.");return;}
   const custom_terms=$("customTerms").value.split("\n").map(s=>s.trim()).filter(Boolean);
+  const allow_list=$("allowList").value.split("\n").map(s=>s.trim()).filter(Boolean);
   $("go").disabled=true;$("go").innerHTML='<span class="spin"></span>Spracúvam…';
   try{
     const res=await fetch("/api/anonymize",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({text,language:$("lang").value,approach:$("approach").value,
-        threshold:parseFloat($("threshold").value),custom_terms})});
+        threshold:parseFloat($("threshold").value),custom_terms,allow_list})});
     const data=await res.json();
     if(!res.ok){showErr(data.error||"Chyba servera.");return;}
     render(data);
@@ -373,6 +389,7 @@ def api_anonymize():
     language = data.get("language") if data.get("language") in SUPPORTED_LANGUAGES else "en"
     approach = data.get("approach") or "replace"
     custom_terms = data.get("custom_terms") or []
+    allow_list = data.get("allow_list") or []
     try:
         threshold = float(data.get("threshold", 0.0))
     except (TypeError, ValueError):
@@ -383,12 +400,18 @@ def api_anonymize():
     results = analyzer.analyze(text=text, language=language, score_threshold=threshold)
     results = results + custom_term_results(text, custom_terms)
 
+    # zlúč duplicitné rozsahy (vyššie skóre vyhráva)
     best = {}
     for r in results:
         k = (r.start, r.end)
         if k not in best or r.score > best[k].score:
             best[k] = r
     results = sorted(best.values(), key=lambda r: r.start)
+
+    # výnimky — tieto presné hodnoty sa nikdy neanonymizujú
+    allow_lower = {a.strip().lower() for a in allow_list if a and a.strip()}
+    if allow_lower:
+        results = [r for r in results if text[r.start:r.end].lower() not in allow_lower]
 
     findings = [{"entity_type": r.entity_type, "text": text[r.start:r.end],
                  "start": r.start, "end": r.end, "score": round(r.score, 2)} for r in results]
